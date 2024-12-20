@@ -1,0 +1,159 @@
+From 8901d61cffc55bf9d181717d8ae41626265e2352 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:13 +0100
+Subject: [PATCH 09/10] route-table: Export route table sync functions.
+To: dev@openvswitch.org
+
+Along with dependent data structures these functions are useful
+for programs that build against OVS private library sources,
+allowing them to make use of functionality provided by the
+route-table module.
+
+A test program to be ran as part of the system tests that
+excercise the exported interfaces will be added in a subsequent
+patch.
+
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ lib/route-table.c | 39 +++------------------------------------
+ lib/route-table.h | 40 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+), 36 deletions(-)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index 98904328e..1fabb8c03 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -48,38 +48,6 @@ VLOG_DEFINE_THIS_MODULE(route_table);
+ 
+ COVERAGE_DEFINE(route_table_dump);
+ 
+-struct route_data_nexthop {
+-    struct ovs_list nexthop_node;
+-
+-    sa_family_t family;
+-    struct in6_addr addr;
+-    char ifname[IFNAMSIZ]; /* Interface name. */
+-};
+-
+-struct route_data {
+-    struct ovs_list nexthops;
+-
+-    /* Copied from struct rtmsg. */
+-    unsigned char rtm_dst_len;
+-    unsigned char rtm_protocol;
+-    bool local;
+-
+-    /* Extracted from Netlink attributes. */
+-    struct in6_addr rta_dst; /* 0 if missing. */
+-    struct in6_addr rta_prefsrc; /* 0 if missing. */
+-    uint32_t mark;
+-    uint32_t rta_table_id; /* 0 if missing. */
+-    uint32_t rta_priority; /* 0 if missing. */
+-};
+-
+-/* A digested version of a route message sent down by the kernel to indicate
+- * that a route has changed. */
+-struct route_table_msg {
+-    bool relevant;        /* Should this message be processed? */
+-    int nlmsg_type;       /* e.g. RTM_NEWROUTE, RTM_DELROUTE. */
+-    struct route_data rd; /* Data parsed from this message. */
+-};
+-
+ static struct ovs_mutex route_table_mutex = OVS_MUTEX_INITIALIZER;
+ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+ 
+@@ -98,14 +66,13 @@ static bool route_table_valid = false;
+ 
+ static void route_table_reset(void);
+ static void route_table_handle_msg(const struct route_table_msg *, void *);
+-static int route_table_parse(struct ofpbuf *, void *change);
+ static void route_table_change(struct route_table_msg *, void *);
+ static void route_map_clear(void);
+ 
+ static void name_table_init(void);
+ static void name_table_change(const struct rtnetlink_change *, void *);
+ 
+-static void
++void
+ route_data_destroy(struct route_data *rd)
+ {
+     struct route_data_nexthop *rdnh;
+@@ -180,7 +147,7 @@ route_table_wait(void)
+     ovs_mutex_unlock(&route_table_mutex);
+ }
+ 
+-static bool
++bool
+ route_table_dump_one_table(
+     uint32_t id,
+     void (*handle_msg)(const struct route_table_msg *, void *),
+@@ -423,7 +390,7 @@ error_out:
+     return 0;
+ }
+ 
+-static int
++int
+ route_table_parse(struct ofpbuf *buf, void *change_)
+ {
+     struct rtmsg *rtm;
+diff --git a/lib/route-table.h b/lib/route-table.h
+index 3a02d737a..2d975f33a 100644
+--- a/lib/route-table.h
++++ b/lib/route-table.h
+@@ -24,8 +24,42 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
++#include "openvswitch/list.h"
++#include "openvswitch/ofpbuf.h"
+ #include "openvswitch/types.h"
+ 
++struct route_data_nexthop {
++    struct ovs_list nexthop_node;
++
++    sa_family_t family;
++    struct in6_addr addr;
++    char ifname[IFNAMSIZ]; /* Interface name. */
++};
++
++struct route_data {
++    struct ovs_list nexthops;
++
++    /* Copied from struct rtmsg. */
++    unsigned char rtm_dst_len;
++    unsigned char rtm_protocol;
++    bool local;
++
++    /* Extracted from Netlink attributes. */
++    struct in6_addr rta_dst; /* 0 if missing. */
++    struct in6_addr rta_prefsrc; /* 0 if missing. */
++    uint32_t mark;
++    uint32_t rta_table_id; /* 0 if missing. */
++    uint32_t rta_priority; /* 0 if missing. */
++};
++
++/* A digested version of a route message sent down by the kernel to indicate
++ * that a route has changed. */
++struct route_table_msg {
++    bool relevant;        /* Should this message be processed? */
++    int nlmsg_type;       /* e.g. RTM_NEWROUTE, RTM_DELROUTE. */
++    struct route_data rd; /* Data parsed from this message. */
++};
++
+ uint64_t route_table_get_change_seq(void);
+ void route_table_init(void);
+ void route_table_run(void);
+@@ -33,4 +67,10 @@ void route_table_wait(void);
+ bool route_table_fallback_lookup(const struct in6_addr *ip6_dst,
+                                  char name[],
+                                  struct in6_addr *gw6);
++bool route_table_dump_one_table(uint32_t id,
++                                void (*handle_msg)(
++                                    const struct route_table_msg *, void *),
++                                void *data);
++int route_table_parse(struct ofpbuf *buf, void *);
++void route_data_destroy(struct route_data *rd);
+ #endif /* route-table.h */
+-- 
+2.43.0
+

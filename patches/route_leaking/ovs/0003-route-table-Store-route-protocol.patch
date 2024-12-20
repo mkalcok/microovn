@@ -1,0 +1,44 @@
+From 7fa6e8599681b3b3531f3cdb267e5f5e58a32366 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:07 +0100
+Subject: [PATCH 03/10] route-table: Store route protocol.
+To: dev@openvswitch.org
+
+The route-table code is useful outside the scope of Open vSwitch.
+In a subsequent patch we will expose the route-table data
+structures to allow projects compiling against the private Open
+vSwitch library to consume this data.
+
+Store the route protocol so that other consumers may read this
+data if relevant to them.
+
+Co-Authored-by: Felix Huettner <felix.huettner@stackit.cloud>
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ lib/route-table.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index e6442220c..b7e7861d6 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -50,6 +50,7 @@ COVERAGE_DEFINE(route_table_dump);
+ struct route_data {
+     /* Copied from struct rtmsg. */
+     unsigned char rtm_dst_len;
++    unsigned char rtm_protocol;
+     bool local;
+ 
+     /* Extracted from Netlink attributes. */
+@@ -291,6 +292,7 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+ 
+         change->nlmsg_type     = nlmsg->nlmsg_type;
+         change->rd.rtm_dst_len = rtm->rtm_dst_len + (ipv4 ? 96 : 0);
++        change->rd.rtm_protocol = rtm->rtm_protocol;
+         change->rd.local = rtm->rtm_type == RTN_LOCAL;
+         if (attrs[RTA_OIF]) {
+             rta_oif = nl_attr_get_u32(attrs[RTA_OIF]);
+-- 
+2.43.0
+

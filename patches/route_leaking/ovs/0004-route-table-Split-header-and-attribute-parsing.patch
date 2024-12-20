@@ -1,0 +1,93 @@
+From 910185c5ac0febfbf53f98223a85d9280058dcbb Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:08 +0100
+Subject: [PATCH 04/10] route-table: Split header and attribute parsing.
+To: dev@openvswitch.org
+
+In a subsequent patch we will introduce support for handling the
+RTA_MULTIPATH attribute.
+
+The RTA_MULTIPATH attribute is a nested attribute containing
+another set of route attributes.  There is some overlap of netlink
+policy for parsing both sets of attributes.
+
+Consequently we would want to reuse the code for parsing these
+attributes, and splitting up the function allows us to do this in
+a subsequent patch.
+
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ lib/route-table.c | 31 ++++++++++++++++++++-----------
+ 1 file changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index b7e7861d6..33e0df2b8 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -225,7 +225,9 @@ route_table_reset(void)
+ /* Return RTNLGRP_IPV4_ROUTE or RTNLGRP_IPV6_ROUTE on success, 0 on parse
+  * error. */
+ static int
+-route_table_parse(struct ofpbuf *buf, void *change_)
++route_table_parse__(struct ofpbuf *buf, size_t ofs,
++                    const struct nlmsghdr *nlmsg,
++                    const struct rtmsg *rtm, void *change_)
+ {
+     struct route_table_msg *change = change_;
+     bool parsed, ipv4 = false;
+@@ -251,28 +253,22 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+     };
+ 
+     struct nlattr *attrs[ARRAY_SIZE(policy)];
+-    const struct rtmsg *rtm;
+-
+-    rtm = ofpbuf_at(buf, NLMSG_HDRLEN, sizeof *rtm);
+ 
+     if (rtm->rtm_family == AF_INET) {
+-        parsed = nl_policy_parse(buf, NLMSG_HDRLEN + sizeof(struct rtmsg),
+-                                 policy, attrs, ARRAY_SIZE(policy));
++        parsed = nl_policy_parse(buf, ofs, policy, attrs,
++                                 ARRAY_SIZE(policy));
+         ipv4 = true;
+     } else if (rtm->rtm_family == AF_INET6) {
+-        parsed = nl_policy_parse(buf, NLMSG_HDRLEN + sizeof(struct rtmsg),
+-                                 policy6, attrs, ARRAY_SIZE(policy6));
++        parsed = nl_policy_parse(buf, ofs, policy6, attrs,
++                                 ARRAY_SIZE(policy6));
+     } else {
+         VLOG_DBG_RL(&rl, "received non AF_INET rtnetlink route message");
+         return 0;
+     }
+ 
+     if (parsed) {
+-        const struct nlmsghdr *nlmsg;
+         int rta_oif;      /* Output interface index. */
+ 
+-        nlmsg = buf->data;
+-
+         memset(change, 0, sizeof *change);
+         change->relevant = true;
+ 
+@@ -355,6 +351,19 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+     return ipv4 ? RTNLGRP_IPV4_ROUTE : RTNLGRP_IPV6_ROUTE;
+ }
+ 
++static int
++route_table_parse(struct ofpbuf *buf, void *change_)
++{
++    struct rtmsg *rtm;
++    struct nlmsghdr *nlmsg;
++
++    nlmsg = ofpbuf_at(buf, 0, NLMSG_HDRLEN);
++    rtm = ofpbuf_at(buf, NLMSG_HDRLEN, sizeof *rtm);
++
++    return route_table_parse__(buf, NLMSG_HDRLEN + sizeof *rtm,
++                               nlmsg, rtm, change_);
++}
++
+ static bool
+ route_table_standard_table(uint32_t table_id)
+ {
+-- 
+2.43.0
+

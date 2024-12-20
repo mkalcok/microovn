@@ -1,0 +1,58 @@
+From e0da853fda68e2f698fe8d2269022cc7f272f49b Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:11 +0100
+Subject: [PATCH 07/10] route-table: Use RTA_TABLE for route table filter.
+To: dev@openvswitch.org
+
+The route-table code is useful outside the scope of Open vSwitch.
+In a subsequent patch we will expose the route-table data
+structures to allow projects compiling against the private Open
+vSwitch library to consume this data.
+
+The rtnetlink rtmsg rtm_table variable can hold route table IDs no
+higher than 256.
+
+Use the rtnetlink RTA_TABLE route attribute instead, which can
+represent a 32 bit integer worth of route tables.
+
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ lib/route-table.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index e7d7a7979..ea56f19c3 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -181,7 +181,7 @@ route_table_wait(void)
+ }
+ 
+ static bool
+-route_table_dump_one_table(unsigned char id)
++route_table_dump_one_table(uint32_t id)
+ {
+     uint64_t reply_stub[NL_DUMP_BUFSIZE / 8];
+     struct ofpbuf request, reply, buf;
+@@ -195,7 +195,9 @@ route_table_dump_one_table(unsigned char id)
+ 
+     rq_msg = ofpbuf_put_zeros(&request, sizeof *rq_msg);
+     rq_msg->rtm_family = AF_UNSPEC;
+-    rq_msg->rtm_table = id;
++    rq_msg->rtm_table = RT_TABLE_UNSPEC;
++
++    nl_msg_put_u32(&request, RTA_TABLE, id);
+ 
+     nl_dump_start(&dump, NETLINK_ROUTE, &request);
+     ofpbuf_uninit(&request);
+@@ -224,7 +226,7 @@ route_table_dump_one_table(unsigned char id)
+ static void
+ route_table_reset(void)
+ {
+-    unsigned char tables[] = {
++    uint32_t tables[] = {
+         RT_TABLE_DEFAULT,
+         RT_TABLE_MAIN,
+         RT_TABLE_LOCAL,
+-- 
+2.43.0
+

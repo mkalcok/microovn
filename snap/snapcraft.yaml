@@ -334,10 +334,12 @@ parts:
     plugin: autotools
     source: https://github.com/ovn-org/ovn.git
     source-type: git
-    source-tag: v24.09.0
+    source-commit: ebe5d70122ce0f74067858f5cb19276c852a81da
     override-build: |
       # build OVS first
       cd ovs
+      # apply prerequisite:  https://mail.openvswitch.org/pipermail/ovs-dev/2024-December/418971.html
+      git am  $CRAFT_PROJECT_DIR/patches/route_leaking/ovs/0*.patch
       ./boot.sh
       ./configure \
         --enable-ssl \
@@ -347,11 +349,12 @@ parts:
       make -j$CRAFT_PARALLEL_BUILD_COUNT
       # build OVN
       cd ..
-      # apply patches related to the route leaking/learning
+      # apply prerequisite: https://mail.openvswitch.org/pipermail/ovs-dev/2024-December/419228.html
+      git am  $CRAFT_PROJECT_DIR/patches/route_leaking/northd/0*.patch
+      # apply prerequisite: https://mail.openvswitch.org/pipermail/ovs-dev/2024-December/419188.html
+      git am  $CRAFT_PROJECT_DIR/patches/route_leaking/controller/0*.patch
+      # apply patches that allow NAT/LB route advertising
       git am  $CRAFT_PROJECT_DIR/patches/route_leaking/0*.patch
-      patch -p1 < $CRAFT_PROJECT_DIR/patches/route_leaking/dont-delete-other-routes.patch
-      git am  $CRAFT_PROJECT_DIR/patches/allow_ipv6_ra/*.patch
-      git am  $CRAFT_PROJECT_DIR/patches/ipv4_over_ipv6/*.patch
       ./boot.sh
       ./configure \
         --prefix=/usr \

@@ -1,0 +1,111 @@
+From 6d34c282234748f27026f16914234320b8834e19 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:05 +0100
+Subject: [PATCH 01/10] route-table: Store route table ID.
+To: dev@openvswitch.org
+
+The route-table code is useful outside the scope of Open vSwitch.
+In a subsequent patch we will expose the route-table data
+structures to allow projects compiling against the private Open
+vSwitch library to consume this data.
+
+Store the route table ID and move filtering to route_table_change
+so that other consumers may read this data if relevant to them.
+
+Extended the system test to assert on change in route_table_dump
+coverage counter to ensure we do not introduce unnecessary
+processing for the OVS route table implementation with this
+change.
+
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ lib/route-table.c     | 26 +++++++++++++++-----------
+ tests/system-route.at |  2 ++
+ 2 files changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index c6cb21394..d1501e46a 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -58,6 +58,7 @@ struct route_data {
+     struct in6_addr rta_gw;
+     char ifname[IFNAMSIZ]; /* Interface name. */
+     uint32_t mark;
++    uint32_t rta_table_id; /* 0 if missing. */
+ };
+ 
+ /* A digested version of a route message sent down by the kernel to indicate
+@@ -264,7 +265,6 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+ 
+     if (parsed) {
+         const struct nlmsghdr *nlmsg;
+-        uint32_t table_id;
+         int rta_oif;      /* Output interface index. */
+ 
+         nlmsg = buf->data;
+@@ -281,16 +281,9 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+             change->relevant = false;
+         }
+ 
+-        table_id = rtm->rtm_table;
++        change->rd.rta_table_id = rtm->rtm_table;
+         if (attrs[RTA_TABLE]) {
+-            table_id = nl_attr_get_u32(attrs[RTA_TABLE]);
+-        }
+-        /* Do not consider changes in non-standard routing tables. */
+-        if (table_id
+-            && table_id != RT_TABLE_DEFAULT
+-            && table_id != RT_TABLE_MAIN
+-            && table_id != RT_TABLE_LOCAL) {
+-            change->relevant = false;
++            change->rd.rta_table_id = nl_attr_get_u32(attrs[RTA_TABLE]);
+         }
+ 
+         change->nlmsg_type     = nlmsg->nlmsg_type;
+@@ -354,11 +347,22 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+     return ipv4 ? RTNLGRP_IPV4_ROUTE : RTNLGRP_IPV6_ROUTE;
+ }
+ 
++static bool
++route_table_standard_table(uint32_t table_id)
++{
++    return !table_id
++           || table_id == RT_TABLE_DEFAULT
++           || table_id == RT_TABLE_MAIN
++           || table_id == RT_TABLE_LOCAL;
++}
++
+ static void
+ route_table_change(const struct route_table_msg *change OVS_UNUSED,
+                    void *aux OVS_UNUSED)
+ {
+-    if (!change || change->relevant) {
++    if (!change
++        || (change->relevant
++            && route_table_standard_table(change->rd.rta_table_id))) {
+         route_table_valid = false;
+     }
+ }
+diff --git a/tests/system-route.at b/tests/system-route.at
+index c0ecad6cf..7616af69d 100644
+--- a/tests/system-route.at
++++ b/tests/system-route.at
+@@ -92,6 +92,7 @@ Cached: 10.0.0.17/32 dev p1-route SRC 10.0.0.17 local
+ Cached: 10.0.0.18/32 dev p1-route SRC 10.0.0.17])
+ 
+ dnl Add a route to a custom routing table and check that OVS doesn't cache it.
++AT_CHECK([ovs-appctl coverage/read-counter route_table_dump > expout], [0])
+ AT_CHECK([ip route add 10.0.0.19/32 dev p1-route table 42])
+ AT_CHECK([ip route show table 42 | grep 'p1-route' | grep -q '10.0.0.19'])
+ dnl Give the main thread a chance to act.
+@@ -102,6 +103,7 @@ Cached: 10.0.0.0/24 dev p1-route SRC 10.0.0.17
+ Cached: 10.0.0.17/32 dev p1-route SRC 10.0.0.17 local
+ Cached: 10.0.0.18/32 dev p1-route SRC 10.0.0.17
+ ])
++AT_CHECK([ovs-appctl coverage/read-counter route_table_dump], [0], [expout])
+ 
+ dnl Delete a route from the main table and check that OVS removes the route
+ dnl from the cache.
+-- 
+2.43.0
+

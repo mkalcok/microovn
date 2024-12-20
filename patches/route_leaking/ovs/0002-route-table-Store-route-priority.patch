@@ -1,0 +1,62 @@
+From 2f3d04051d92ff11750f20902d1bea3961caea0d Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:06 +0100
+Subject: [PATCH 02/10] route-table: Store route priority.
+To: dev@openvswitch.org
+
+The route-table code is useful outside the scope of Open vSwitch.
+In a subsequent patch we will expose the route-table data
+structures to allow projects compiling against the private Open
+vSwitch library to consume this data.
+
+Store the route priority so that other consumers may read this
+data if relevant to them.
+
+Co-Authored-by: Felix Huettner <felix.huettner@stackit.cloud>
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ lib/route-table.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index d1501e46a..e6442220c 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -59,6 +59,7 @@ struct route_data {
+     char ifname[IFNAMSIZ]; /* Interface name. */
+     uint32_t mark;
+     uint32_t rta_table_id; /* 0 if missing. */
++    uint32_t rta_priority; /* 0 if missing. */
+ };
+ 
+ /* A digested version of a route message sent down by the kernel to indicate
+@@ -235,6 +236,7 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+         [RTA_MARK] = { .type = NL_A_U32, .optional = true },
+         [RTA_PREFSRC] = { .type = NL_A_U32, .optional = true },
+         [RTA_TABLE] = { .type = NL_A_U32, .optional = true },
++        [RTA_PRIORITY] = { .type = NL_A_U32, .optional = true },
+     };
+ 
+     static const struct nl_policy policy6[] = {
+@@ -244,6 +246,7 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+         [RTA_GATEWAY] = { .type = NL_A_IPV6, .optional = true },
+         [RTA_PREFSRC] = { .type = NL_A_IPV6, .optional = true },
+         [RTA_TABLE] = { .type = NL_A_U32, .optional = true },
++        [RTA_PRIORITY] = { .type = NL_A_U32, .optional = true },
+     };
+ 
+     struct nlattr *attrs[ARRAY_SIZE(policy)];
+@@ -338,6 +341,9 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+         if (attrs[RTA_MARK]) {
+             change->rd.mark = nl_attr_get_u32(attrs[RTA_MARK]);
+         }
++        if (attrs[RTA_PRIORITY]) {
++            change->rd.rta_priority = nl_attr_get_u32(attrs[RTA_PRIORITY]);
++        }
+     } else {
+         VLOG_DBG_RL(&rl, "received unparseable rtnetlink route message");
+         return 0;
+-- 
+2.43.0
+

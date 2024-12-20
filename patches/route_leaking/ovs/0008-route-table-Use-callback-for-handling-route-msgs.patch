@@ -1,0 +1,76 @@
+From 67bc65125aa8517d73bce7d52de13832d484f004 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:12 +0100
+Subject: [PATCH 08/10] route-table: Use callback for handling route msgs.
+To: dev@openvswitch.org
+
+The route-table code is useful outside the scope of Open vSwitch.
+In a subsequent patch we will expose the route-table data
+structures to allow projects compiling against the private Open
+vSwitch library to consume this data.
+
+This allows external callers to provide their own function for
+handling route messages processed by the route-table module.
+
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ lib/route-table.c | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index ea56f19c3..98904328e 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -97,7 +97,7 @@ static struct nln_notifier *name_notifier = NULL;
+ static bool route_table_valid = false;
+ 
+ static void route_table_reset(void);
+-static void route_table_handle_msg(const struct route_table_msg *);
++static void route_table_handle_msg(const struct route_table_msg *, void *);
+ static int route_table_parse(struct ofpbuf *, void *change);
+ static void route_table_change(struct route_table_msg *, void *);
+ static void route_map_clear(void);
+@@ -181,7 +181,10 @@ route_table_wait(void)
+ }
+ 
+ static bool
+-route_table_dump_one_table(uint32_t id)
++route_table_dump_one_table(
++    uint32_t id,
++    void (*handle_msg)(const struct route_table_msg *, void *),
++    void *data)
+ {
+     uint64_t reply_stub[NL_DUMP_BUFSIZE / 8];
+     struct ofpbuf request, reply, buf;
+@@ -213,7 +216,7 @@ route_table_dump_one_table(uint32_t id)
+             if (!(nlmsghdr->nlmsg_flags & NLM_F_DUMP_FILTERED)) {
+                 filtered = false;
+             }
+-            route_table_handle_msg(&msg);
++            (*handle_msg)(&msg, data);
+             route_data_destroy(&msg.rd);
+         }
+     }
+@@ -240,7 +243,8 @@ route_table_reset(void)
+     COVERAGE_INC(route_table_dump);
+ 
+     for (size_t i = 0; i < ARRAY_SIZE(tables); i++) {
+-        if (!route_table_dump_one_table(tables[i])) {
++        if (!route_table_dump_one_table(tables[i],
++                                        route_table_handle_msg, NULL)) {
+             /* Got unfiltered reply, no need to dump further. */
+             break;
+         }
+@@ -456,7 +460,8 @@ route_table_change(struct route_table_msg *change,
+ }
+ 
+ static void
+-route_table_handle_msg(const struct route_table_msg *change)
++route_table_handle_msg(const struct route_table_msg *change,
++                       void *data OVS_UNUSED)
+ {
+     if (change->relevant && change->nlmsg_type == RTM_NEWROUTE) {
+         const struct route_data *rd = &change->rd;
+-- 
+2.43.0
+

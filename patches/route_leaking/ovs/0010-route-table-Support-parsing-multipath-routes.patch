@@ -1,0 +1,433 @@
+From 4417b956882d5e385ca72e63c1352512e8495b45 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:14 +0100
+Subject: [PATCH 10/10] route-table: Support parsing multipath routes.
+To: dev@openvswitch.org
+
+The route-table code is useful outside the scope of Open vSwitch.
+In a subsequent patch we will expose the route-table data
+structures to allow projects compiling against the private Open
+vSwitch library to consume this data.
+
+Add support for storing and parsing multipath routes.
+
+Note that the internal handling of routes in the ovs-route module
+does currently not support multipath routes, so when presented
+with one the latter occurrence will be stored.  This is not a
+regression as these routes were previously not considered at all.
+
+Storing the information in the route-table module data structure
+will allow external to OVS projects make use of this data.  A
+test program ran as part of the system tests that excercise the
+exported interfaces is added in this patch.
+
+Co-Authored-by: Felix Huettner <felix.huettner@stackit.cloud>
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ Makefile.am                  |   3 +-
+ lib/route-table.c            |  51 +++++++++++++---
+ tests/automake.mk            |   1 +
+ tests/system-route.at        | 111 ++++++++++++++++++++++++++++++++++
+ tests/test-lib-route-table.c | 112 +++++++++++++++++++++++++++++++++++
+ 5 files changed, 269 insertions(+), 9 deletions(-)
+ create mode 100644 tests/test-lib-route-table.c
+
+diff --git a/Makefile.am b/Makefile.am
+index dc5c34a6a..3c7cb51d9 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -346,7 +346,8 @@ thread-safety-check:
+ 	  grep -n -f build-aux/thread-safety-forbidden \
+ 	    `git ls-files | grep '\.[ch]$$' \
+ 	      | $(EGREP) -v '^datapath-windows|^lib/sflow|^third-party'` /dev/null \
+-	      | $(EGREP) -v ':[ 	]*/?\*'; \
++	      | $(EGREP) -v ':[ 	]*/?\*' \
++	      | $(EGREP) -v '^tests/test-lib-route-table.c'; \
+ 	then \
+ 	  echo "See above for list of calls to functions that are"; \
+ 	  echo "forbidden due to thread safety issues"; \
+diff --git a/lib/route-table.c b/lib/route-table.c
+index 1fabb8c03..db2100403 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -222,8 +222,8 @@ route_table_reset(void)
+  * error. */
+ static int
+ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+-                    const struct nlmsghdr *nlmsg,
+-                    const struct rtmsg *rtm, void *change_)
++                    const struct nlmsghdr *nlmsg, const struct rtmsg *rtm,
++                    const struct rtnexthop *rtnh, void *change_)
+ {
+     struct route_table_msg *change = change_;
+     struct route_data_nexthop *rdnh = NULL;
+@@ -238,6 +238,7 @@ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+         [RTA_TABLE] = { .type = NL_A_U32, .optional = true },
+         [RTA_PRIORITY] = { .type = NL_A_U32, .optional = true },
+         [RTA_VIA] = { .type = NL_A_UNSPEC, .optional = true },
++        [RTA_MULTIPATH] = { .type = NL_A_NESTED, .optional = true },
+     };
+ 
+     static const struct nl_policy policy6[] = {
+@@ -249,6 +250,7 @@ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+         [RTA_TABLE] = { .type = NL_A_U32, .optional = true },
+         [RTA_PRIORITY] = { .type = NL_A_U32, .optional = true },
+         [RTA_VIA] = { .type = NL_A_UNSPEC, .optional = true },
++        [RTA_MULTIPATH] = { .type = NL_A_NESTED, .optional = true },
+     };
+ 
+     struct nlattr *attrs[ARRAY_SIZE(policy)];
+@@ -270,8 +272,8 @@ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+ 
+         memset(change, 0, sizeof *change);
+         ovs_list_init(&change->rd.nexthops);
+-        memset(&rdnh_single, 0, sizeof *rdnh);
+-        rdnh = &rdnh_single;
++        rdnh = rtnh ? xmalloc(sizeof *rdnh) : &rdnh_single;
++        memset(rdnh, 0, sizeof *rdnh);
+         change->relevant = true;
+ 
+         if (rtm->rtm_scope == RT_SCOPE_NOWHERE) {
+@@ -292,8 +294,9 @@ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+         change->rd.rtm_dst_len = rtm->rtm_dst_len + (ipv4 ? 96 : 0);
+         change->rd.rtm_protocol = rtm->rtm_protocol;
+         change->rd.local = rtm->rtm_type == RTN_LOCAL;
+-        if (attrs[RTA_OIF]) {
+-            rta_oif = nl_attr_get_u32(attrs[RTA_OIF]);
++        if (attrs[RTA_OIF] || rtnh) {
++            rta_oif = rtnh
++                ? rtnh->rtnh_ifindex : nl_attr_get_u32(attrs[RTA_OIF]);
+ 
+             if (!if_indextoname(rta_oif, rdnh->ifname)) {
+                 int error = errno;
+@@ -374,7 +377,38 @@ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+                 goto error_out;
+             }
+         }
+-        ovs_list_insert(&change->rd.nexthops, &rdnh->nexthop_node);
++        if (!attrs[RTA_MULTIPATH]) {
++            ovs_list_insert(&change->rd.nexthops, &rdnh->nexthop_node);
++        } else {
++            if (rtnh) {
++                VLOG_DBG_RL(&rl, "Unexpected nested RTA_MULTIPATH attribute.");
++                goto error_out;
++            }
++            const struct nlattr *nla;
++            size_t left;
++
++            NL_NESTED_FOR_EACH (nla, left, attrs[RTA_MULTIPATH]) {
++                struct route_table_msg mp_change;
++                struct rtnexthop *mp_rtnh;
++                struct ofpbuf mp_buf;
++
++                ofpbuf_use_data(&mp_buf, nla, nla->nla_len);
++                mp_rtnh = ofpbuf_try_pull(&mp_buf, sizeof *mp_rtnh);
++                if (!mp_rtnh) {
++                    VLOG_DBG_RL(&rl, "Got short message while parsing "
++                                "multipath attribute.");
++                    goto error_out;
++                }
++
++                if (!route_table_parse__(&mp_buf, 0, nlmsg, rtm, mp_rtnh,
++                                         &mp_change)) {
++                    goto error_out;
++                }
++                ovs_list_push_back_all(&change->rd.nexthops,
++                                       &mp_change.rd.nexthops);
++            }
++        }
++        /* Add any additional RTA attribute processing before RTA_MULTIPATH. */
+     } else {
+         VLOG_DBG_RL(&rl, "received unparseable rtnetlink route message");
+         goto error_out;
+@@ -387,6 +421,7 @@ error_out:
+     if (rdnh && rdnh != &rdnh_single) {
+         free (rdnh);
+     }
++    route_data_destroy(&change->rd);
+     return 0;
+ }
+ 
+@@ -400,7 +435,7 @@ route_table_parse(struct ofpbuf *buf, void *change_)
+     rtm = ofpbuf_at(buf, NLMSG_HDRLEN, sizeof *rtm);
+ 
+     return route_table_parse__(buf, NLMSG_HDRLEN + sizeof *rtm,
+-                               nlmsg, rtm, change_);
++                               nlmsg, rtm, NULL, change_);
+ }
+ 
+ static bool
+diff --git a/tests/automake.mk b/tests/automake.mk
+index edfc2cb33..59f538761 100644
+--- a/tests/automake.mk
++++ b/tests/automake.mk
+@@ -498,6 +498,7 @@ endif
+ 
+ if LINUX
+ tests_ovstest_SOURCES += \
++	tests/test-lib-route-table.c \
+ 	tests/test-netlink-conntrack.c \
+ 	tests/test-netlink-policy.c \
+ 	tests/test-psample.c
+diff --git a/tests/system-route.at b/tests/system-route.at
+index 46db676f2..82b029e1e 100644
+--- a/tests/system-route.at
++++ b/tests/system-route.at
+@@ -44,6 +44,36 @@ Cached: 192.168.10.13/32 dev br0 GW 192.168.9.1 SRC 192.168.9.3])
+ OVS_TRAFFIC_VSWITCHD_STOP
+ AT_CLEANUP
+ 
++AT_SETUP([ovs-route - add system route with multiple nexthop - ipv4])
++AT_KEYWORDS([route])
++OVS_TRAFFIC_VSWITCHD_START()
++
++dnl Create tap ports.
++AT_CHECK([ip tuntap add name p1-route mode tap])
++AT_CHECK([ip link set p1-route up])
++on_exit 'ip link del p1-route'
++AT_CHECK([ip tuntap add name p2-route mode tap])
++AT_CHECK([ip link set p2-route up])
++on_exit 'ip link del p2-route'
++
++AT_CHECK([ip addr add 192.168.42.10/24 dev p1-route], [0], [stdout])
++AT_CHECK([ip addr add 192.168.51.10/24 dev p2-route], [0], [stdout])
++AT_CHECK([ip route add 172.16.42.0/24 nexthop via 192.168.42.1 dev p1-route nexthop via 192.168.51.1 dev p2-route], [0], [stdout])
++
++dnl NOTE(fnordahl): At the time of this writing, it is expected that only the
++dnl                 second route will be stored in ovs-router.
++OVS_WAIT_UNTIL_EQUAL([ovs-appctl ovs/route/show | grep -E '172.16.42.0/24' | sort], [dnl
++Cached: 172.16.42.0/24 dev p2-route GW 192.168.51.1 SRC 192.168.51.10])
++
++dnl Confirm that both nexthops are available when using the route-table library
++dnl directly.
++OVS_WAIT_UNTIL_EQUAL([ovstest test-lib-route-table-dump | grep 172.16.42.0.*nexthop | sort], [dnl
++    rta_dst: ::ffff:172.16.42.0 nexthop family: 0 addr: ::ffff:192.168.42.1 ifname: p1-route
++    rta_dst: ::ffff:172.16.42.0 nexthop family: 0 addr: ::ffff:192.168.51.1 ifname: p2-route])
++
++OVS_TRAFFIC_VSWITCHD_STOP
++AT_CLEANUP
++
+ AT_SETUP([ovs-route - add system route with src - ipv6])
+ AT_KEYWORDS([route])
+ OVS_TRAFFIC_VSWITCHD_START()
+@@ -65,6 +95,36 @@ Cached: fc00:db8:beef::13/128 dev br0 GW fc00:db8:cafe::1 SRC fc00:db8:cafe::2])
+ OVS_TRAFFIC_VSWITCHD_STOP
+ AT_CLEANUP
+ 
++AT_SETUP([ovs-route - add system route with multiple nexthop - ipv6])
++AT_KEYWORDS([route])
++OVS_TRAFFIC_VSWITCHD_START()
++
++dnl Create tap ports.
++AT_CHECK([ip tuntap add name p1-route mode tap])
++AT_CHECK([ip link set p1-route up])
++on_exit 'ip link del p1-route'
++AT_CHECK([ip tuntap add name p2-route mode tap])
++AT_CHECK([ip link set p2-route up])
++on_exit 'ip link del p2-route'
++
++AT_CHECK([ip -6 addr add fc00:db8:dead::10/64 dev p1-route], [0], [stdout])
++AT_CHECK([ip -6 addr add fc00:db8:beef::10/64 dev p2-route], [0], [stdout])
++AT_CHECK([ip -6 route add fc00:db8:cafe::/64 nexthop via fc00:db8:dead::1 dev p1-route nexthop via fc00:db8:beef::1 dev p2-route], [0], [stdout])
++
++dnl NOTE(fnordahl): At the time of this writing, it is expected that only the
++dnl                 second route will be stored in ovs-router.
++OVS_WAIT_UNTIL_EQUAL([ovs-appctl ovs/route/show | grep -E 'fc00:db8:cafe::/64' | sort], [dnl
++Cached: fc00:db8:cafe::/64 dev p2-route GW fc00:db8:beef::1 SRC fc00:db8:beef::10])
++
++dnl Confirm that both nexthops are available when using the route-table library
++dnl directly.
++OVS_WAIT_UNTIL_EQUAL([ovstest test-lib-route-table-dump | grep fc00:db8:cafe::.*nexthop | sort], [dnl
++    rta_dst: fc00:db8:cafe:: nexthop family: 0 addr: fc00:db8:beef::1 ifname: p2-route
++    rta_dst: fc00:db8:cafe:: nexthop family: 0 addr: fc00:db8:dead::1 ifname: p1-route])
++
++OVS_TRAFFIC_VSWITCHD_STOP
++AT_CLEANUP
++
+ AT_SETUP([ovs-route - add system route - ipv4 via ipv6 nexthop])
+ AT_KEYWORDS([route])
+ OVS_TRAFFIC_VSWITCHD_START()
+@@ -83,6 +143,36 @@ Cached: 192.168.10.12/32 dev br0 GW fe80::253:ff:fe00:51 SRC fe80::253:ff:fe00:4
+ OVS_TRAFFIC_VSWITCHD_STOP
+ AT_CLEANUP
+ 
++AT_SETUP([ovs-route - add system route - ipv4 via multiple ipv6 nexthop])
++AT_KEYWORDS([route])
++OVS_TRAFFIC_VSWITCHD_START()
++
++dnl Create tap ports.
++AT_CHECK([ip tuntap add name p1-route mode tap])
++AT_CHECK([ip link set p1-route up])
++on_exit 'ip link del p1-route'
++AT_CHECK([ip tuntap add name p2-route mode tap])
++AT_CHECK([ip link set p2-route up])
++on_exit 'ip link del p2-route'
++
++AT_CHECK([ip -6 addr add fc00:db8:dead::10/64 dev p1-route], [0], [stdout])
++AT_CHECK([ip -6 addr add fc00:db8:beef::10/64 dev p2-route], [0], [stdout])
++AT_CHECK([ip route add 172.16.42.0/24 nexthop via inet6 fc00:db8:dead::1 dev p1-route nexthop via inet6 fc00:db8:beef::1 dev p2-route], [0], [stdout])
++
++dnl NOTE(fnordahl): At the time of this writing, it is expected that only the
++dnl                 second route will be stored in ovs-router.
++OVS_WAIT_UNTIL_EQUAL([ovs-appctl ovs/route/show | grep -E '172.16.42.0/24' | sort], [dnl
++Cached: 172.16.42.0/24 dev p2-route GW fc00:db8:beef::1 SRC fc00:db8:beef::10])
++
++dnl Confirm that both nexthops are available when using the route-table library
++dnl directly.
++OVS_WAIT_UNTIL_EQUAL([ovstest test-lib-route-table-dump | grep 172.16.42.0.*nexthop | sort], [dnl
++    rta_dst: ::ffff:172.16.42.0 nexthop family: 10 addr: fc00:db8:beef::1 ifname: p2-route
++    rta_dst: ::ffff:172.16.42.0 nexthop family: 10 addr: fc00:db8:dead::1 ifname: p1-route])
++
++OVS_TRAFFIC_VSWITCHD_STOP
++AT_CLEANUP
++
+ dnl Checks that OVS doesn't use routes from non-standard tables.
+ AT_SETUP([ovs-route - route tables])
+ AT_KEYWORDS([route])
+@@ -148,3 +238,24 @@ OVS_WAIT_UNTIL([test $(ovs-appctl ovs/route/show | grep -c 'p1-route') -eq 0 ])
+ 
+ OVS_TRAFFIC_VSWITCHD_STOP
+ AT_CLEANUP
++
++AT_SETUP([route-table - exported functions work for netlink-notifier])
++AT_KEYWORDS([route])
++
++dnl Create tap ports.
++AT_CHECK([ip tuntap add name p1-route mode tap])
++AT_CHECK([ip link set p1-route up])
++on_exit 'ip link del p1-route'
++AT_CHECK([ip tuntap add name p2-route mode tap])
++AT_CHECK([ip link set p2-route up])
++on_exit 'ip link del p2-route'
++
++AT_CHECK([ip -6 addr add fc00:db8:dead::10/64 dev p1-route], [0], [stdout])
++AT_CHECK([ip -6 addr add fc00:db8:beef::10/64 dev p2-route], [0], [stdout])
++
++AT_CHECK([ovstest test-lib-route-table-monitor 'ip route add 172.16.42.0/24 nexthop via inet6 fc00:db8:dead::1 dev p1-route nexthop via inet6 fc00:db8:beef::1 dev p2-route'| grep 172.16.42.0.*nexthop | sort], [0], [dnl
++    rta_dst: ::ffff:172.16.42.0 nexthop family: 10 addr: fc00:db8:beef::1 ifname: p2-route
++    rta_dst: ::ffff:172.16.42.0 nexthop family: 10 addr: fc00:db8:dead::1 ifname: p1-route
++])
++
++AT_CLEANUP
+diff --git a/tests/test-lib-route-table.c b/tests/test-lib-route-table.c
+new file mode 100644
+index 000000000..82d1dbc69
+--- /dev/null
++++ b/tests/test-lib-route-table.c
+@@ -0,0 +1,112 @@
++/*
++ * Copyright (c) 2009, 2014 Nicira, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#undef NDEBUG
++
++#include <linux/rtnetlink.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "netlink-notifier.h"
++#include "ovstest.h"
++#include "packets.h"
++#include "route-table.h"
++
++static void
++test_lib_route_table_handle_msg(const struct route_table_msg *change,
++                                void *data OVS_UNUSED)
++{
++    const struct route_data *rd = &change->rd;
++    const struct route_data_nexthop *rdnh;
++    struct ds rta_dst = DS_EMPTY_INITIALIZER;
++    struct ds rta_prefsrc = DS_EMPTY_INITIALIZER;
++    struct ds nexthop_addr = DS_EMPTY_INITIALIZER;
++
++    ipv6_format_addr(&change->rd.rta_dst, &rta_dst);
++    ipv6_format_addr(&change->rd.rta_prefsrc, &rta_prefsrc);
++    printf("relevant: %d nlmsg_type: %d rtm_dst_len: %u rtm_protocol: %u "
++           "local: %d rta_dst: %s rta_prefsrc: %s mark: %"PRIu32" "
++           "rta_table_id: %"PRIu32" rta_priority: %"PRIu32"\n",
++           change->relevant, change->nlmsg_type,
++           rd->rtm_dst_len, rd->rtm_protocol, rd->local,
++           ds_cstr(&rta_dst), ds_cstr(&rta_prefsrc),
++           rd->mark, rd->rta_table_id, rd->rta_priority);
++
++    LIST_FOR_EACH (rdnh, nexthop_node, &rd->nexthops) {
++        ds_clear(&nexthop_addr);
++        ipv6_format_addr(&rdnh->addr, &nexthop_addr);
++        printf("    rta_dst: %s nexthop family: %d addr: %s ifname: %s\n",
++               ds_cstr(&rta_dst), rdnh->family, ds_cstr(&nexthop_addr),
++               rdnh->ifname);
++    }
++    ds_destroy(&rta_dst);
++    ds_destroy(&rta_prefsrc);
++    ds_destroy(&nexthop_addr);
++}
++
++static void
++test_lib_route_table_dump(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
++{
++    route_table_dump_one_table(RT_TABLE_MAIN,
++                               test_lib_route_table_handle_msg,
++                               NULL);
++}
++
++static void
++test_lib_route_table_change(struct route_table_msg *change,
++                            void *aux OVS_UNUSED)
++{
++    test_lib_route_table_handle_msg(change, NULL);
++    route_data_destroy(&change->rd);
++}
++
++static struct nln *nln = NULL;
++static struct nln_notifier *route_notifier = NULL;
++static struct nln_notifier *route6_notifier = NULL;
++static struct route_table_msg rtmsg;
++
++static void
++test_lib_route_table_monitor(int argc, char *argv[])
++{
++    if (argc != 2) {
++        printf("usage: ovstest %s 'ip route add ...'\n", argv[0]);
++        exit(EXIT_FAILURE);
++    }
++    const char *cmd = argv[1];
++
++    nln = nln_create(NETLINK_ROUTE, route_table_parse, &rtmsg);
++
++    route_notifier =
++        nln_notifier_create(nln, RTNLGRP_IPV4_ROUTE,
++                            (nln_notify_func *) test_lib_route_table_change,
++                            NULL);
++    route6_notifier =
++        nln_notifier_create(nln, RTNLGRP_IPV6_ROUTE,
++                            (nln_notify_func *) test_lib_route_table_change,
++                            NULL);
++    nln_run(nln);
++    nln_wait(nln);
++    int rc = system(cmd);
++    if (rc) {
++        exit(rc);
++    }
++    nln_run(nln);
++}
++
++OVSTEST_REGISTER("test-lib-route-table-dump", test_lib_route_table_dump);
++OVSTEST_REGISTER("test-lib-route-table-monitor", test_lib_route_table_monitor);
+-- 
+2.43.0
+

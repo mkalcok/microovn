@@ -1,0 +1,112 @@
+From e4ce2e1713533192c36e539da5aad9da1328466b Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Tue, 10 Dec 2024 23:18:10 +0100
+Subject: [PATCH 06/10] route-table: Support parsing RTA_VIA attribute.
+To: dev@openvswitch.org
+
+This is a prerequisite for parsing RTA_MULTIPATH attribute whose
+support will be added in a subsequent patch.
+
+Signed-off-by: Frode Nordahl <fnordahl@ubuntu.com>
+---
+ lib/route-table.c     | 33 +++++++++++++++++++++++++++++++++
+ tests/system-route.at | 18 ++++++++++++++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index fd26ac688..e7d7a7979 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -51,6 +51,7 @@ COVERAGE_DEFINE(route_table_dump);
+ struct route_data_nexthop {
+     struct ovs_list nexthop_node;
+ 
++    sa_family_t family;
+     struct in6_addr addr;
+     char ifname[IFNAMSIZ]; /* Interface name. */
+ };
+@@ -263,6 +264,7 @@ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+         [RTA_PREFSRC] = { .type = NL_A_U32, .optional = true },
+         [RTA_TABLE] = { .type = NL_A_U32, .optional = true },
+         [RTA_PRIORITY] = { .type = NL_A_U32, .optional = true },
++        [RTA_VIA] = { .type = NL_A_UNSPEC, .optional = true },
+     };
+ 
+     static const struct nl_policy policy6[] = {
+@@ -273,6 +275,7 @@ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+         [RTA_PREFSRC] = { .type = NL_A_IPV6, .optional = true },
+         [RTA_TABLE] = { .type = NL_A_U32, .optional = true },
+         [RTA_PRIORITY] = { .type = NL_A_U32, .optional = true },
++        [RTA_VIA] = { .type = NL_A_UNSPEC, .optional = true },
+     };
+ 
+     struct nlattr *attrs[ARRAY_SIZE(policy)];
+@@ -368,6 +371,36 @@ route_table_parse__(struct ofpbuf *buf, size_t ofs,
+         if (attrs[RTA_PRIORITY]) {
+             change->rd.rta_priority = nl_attr_get_u32(attrs[RTA_PRIORITY]);
+         }
++        if (attrs[RTA_VIA]) {
++            const struct rtvia *rtvia = nl_attr_get(attrs[RTA_VIA]);
++            rdnh->family = rtvia->rtvia_family;
++            ovs_be32 addr;
++
++            switch (rdnh->family) {
++            case AF_INET:
++                if (nl_attr_get_size(attrs[RTA_VIA])
++                        - sizeof rtvia->rtvia_family < sizeof addr) {
++                    VLOG_DBG_RL(&rl, "Got short message while parsing RTA_VIA "
++                                "attribute for family AF_INET.");
++                    goto error_out;
++                }
++                memcpy(&addr, rtvia->rtvia_addr, sizeof addr);
++                in6_addr_set_mapped_ipv4(&rdnh->addr, addr);
++                break;
++            case AF_INET6:
++                if (nl_attr_get_size(attrs[RTA_VIA])
++                        - sizeof rtvia->rtvia_family < sizeof rdnh->addr) {
++                    VLOG_DBG_RL(&rl, "Got short message while parsing RTA_VIA "
++                                "attribute for family AF_INET6.");
++                    goto error_out;
++                }
++                memcpy(&rdnh->addr, rtvia->rtvia_addr, sizeof rdnh->addr);
++                break;
++            default:
++                VLOG_DBG_RL(&rl, "No address family in via attribute.");
++                goto error_out;
++            }
++        }
+         ovs_list_insert(&change->rd.nexthops, &rdnh->nexthop_node);
+     } else {
+         VLOG_DBG_RL(&rl, "received unparseable rtnetlink route message");
+diff --git a/tests/system-route.at b/tests/system-route.at
+index 7616af69d..46db676f2 100644
+--- a/tests/system-route.at
++++ b/tests/system-route.at
+@@ -65,6 +65,24 @@ Cached: fc00:db8:beef::13/128 dev br0 GW fc00:db8:cafe::1 SRC fc00:db8:cafe::2])
+ OVS_TRAFFIC_VSWITCHD_STOP
+ AT_CLEANUP
+ 
++AT_SETUP([ovs-route - add system route - ipv4 via ipv6 nexthop])
++AT_KEYWORDS([route])
++OVS_TRAFFIC_VSWITCHD_START()
++AT_CHECK([ovs-vsctl set bridge br0 other-config:hwaddr=00:53:00:00:00:42])
++AT_CHECK([ip link set br0 up])
++
++AT_CHECK([ip addr add 192.168.9.2/24 dev br0], [0], [stdout])
++
++AT_CHECK([ip route add 192.168.10.12/32 via inet6 fe80::253:ff:fe00:51 dev br0], [0], [stdout])
++
++AT_CHECK([ovs-appctl revalidator/wait])
++
++OVS_WAIT_UNTIL_EQUAL([ovs-appctl ovs/route/show | grep -E '192.168.10.12/32' | sort], [dnl
++Cached: 192.168.10.12/32 dev br0 GW fe80::253:ff:fe00:51 SRC fe80::253:ff:fe00:42])
++
++OVS_TRAFFIC_VSWITCHD_STOP
++AT_CLEANUP
++
+ dnl Checks that OVS doesn't use routes from non-standard tables.
+ AT_SETUP([ovs-route - route tables])
+ AT_KEYWORDS([route])
+-- 
+2.43.0
+
